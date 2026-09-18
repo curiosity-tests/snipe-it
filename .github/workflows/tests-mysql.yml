@@ -37,8 +37,8 @@ on:
         default: ""
   push:
     branches:
-      - master
-      - develop
+    - master
+    - develop
   pull_request:
 
 permissions:
@@ -59,96 +59,163 @@ jobs:
           MYSQL_ALLOW_EMPTY_PASSWORD: yes
           MYSQL_DATABASE: snipeit
         ports:
-          - 33306:3306
+        - 33306:3306
         options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
 
     strategy:
       fail-fast: false
       matrix:
         php-version:
-          - "8.2"
-          - "8.3"
-          - "8.4"
-          - "8.5"
+        - "8.2"
+        - "8.3"
+        - "8.4"
+        - "8.5"
 
     name: PHP ${{ matrix.php-version }}
 
     steps:
-      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2.37.2
-        with:
-          php-version: "${{ matrix.php-version }}"
-          coverage: none
+    - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240   # v2.37.2
+      with:
+        php-version: "${{ matrix.php-version }}"
+        coverage: none
           # ParaTest spawns a worker per core as a separate PHP process
           # and forwards ini flags only via --passthru-php, so bump the
           # memory limit here when setting up PHP rather than
           # on the test command.
-          ini-values: memory_limit=1G
+        ini-values: memory_limit=1G
 
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-          persist-credentials: false
+    - uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+        persist-credentials: false
 
-      - name: Assert instrumentation is live
-        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
-        # LD_PRELOAD once it has injected, so an empty value is what success
-        # looks like. co-hostd also daemonizes, so pgrep does not match it.
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Get Composer Cache Directory
+      id: composer-cache
+      run: |
+        echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+    - uses: actions/cache@v6
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: ${{ runner.os }}-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.php-version }}-composer-
 
+    - name: Copy .env
+      run: |
+        cp -v .env.testing.example .env
+        cp -v .env.testing.example .env.testing
 
-      - name: Get Composer Cache Directory
-        id: composer-cache
-        run: |
-          echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
-      - uses: actions/cache@v6
-        with:
-          path: ${{ steps.composer-cache.outputs.dir }}
-          key: ${{ runner.os }}-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.php-version }}-composer-
+    - name: Install Dependencies
+      run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
 
-      - name: Copy .env
-        run: |
-          cp -v .env.testing.example .env
-          cp -v .env.testing.example .env.testing
+    - name: Setup Laravel
+      env:
+        DB_CONNECTION: mysql
+        DB_DATABASE: snipeit
+        DB_PORT: ${{ job.services.mysql.ports[3306] }}
+        DB_USERNAME: root
+      run: |
+        php artisan key:generate
+        php artisan migrate --force
+        php artisan passport:install --no-interaction
+        chmod -R 777 storage bootstrap/cache
 
-      - name: Install Dependencies
-        run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
+    - name: Execute tests (Unit and Feature tests) via PHPUnit
+      env:
+        DB_CONNECTION: mysql
+        DB_DATABASE: snipeit
+        DB_PORT: ${{ job.services.mysql.ports[3306] }}
+        DB_USERNAME: root
+        LOG_CHANNEL: single
+        LOG_LEVEL: debug
+      run: php artisan test --parallel
 
-      - name: Setup Laravel
-        env:
-          DB_CONNECTION: mysql
-          DB_DATABASE: snipeit
-          DB_PORT: ${{ job.services.mysql.ports[3306] }}
-          DB_USERNAME: root
-        run: |
-          php artisan key:generate
-          php artisan migrate --force
-          php artisan passport:install --no-interaction
-          chmod -R 777 storage bootstrap/cache
+    - name: Upload Laravel logs as artifacts
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: laravel-logs-php-${{ matrix.php-version }}-run-${{ github.run_attempt }}
+        path: |
+          storage/logs/*.log
+        if-no-files-found: ignore
+        retention-days: 7
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
-      - name: Execute tests (Unit and Feature tests) via PHPUnit
-        env:
-          DB_CONNECTION: mysql
-          DB_DATABASE: snipeit
-          DB_PORT: ${{ job.services.mysql.ports[3306] }}
-          DB_USERNAME: root
-          LOG_CHANNEL: single
-          LOG_LEVEL: debug
-        run: php artisan test --parallel
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
 
-      - name: Upload Laravel logs as artifacts
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: laravel-logs-php-${{ matrix.php-version }}-run-${{ github.run_attempt }}
-          path: |
-            storage/logs/*.log
-          if-no-files-found: ignore
-          retention-days: 7
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
