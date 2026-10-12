@@ -13,8 +13,6 @@ on:
   # Weekly rebuild so the rolling 'v{major}-latest-alpine' tag picks up
   # base-OS security patches (e.g. Alpine apk package updates) even when no
   # new Snipe-IT version has been tagged. Does NOT touch immutable vX.Y.Z tags.
-  schedule:
-    - cron: '0 6 * * 1'
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
